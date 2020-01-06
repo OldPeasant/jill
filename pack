@@ -1,0 +1,22 @@
+#!/usr/bin/python3
+
+import os
+
+SOURCE_FILES = ["{}.py".format(f) for f in "conf util tui model app".split()]
+with open("dist/jill", "w") as tgt:
+    with open("jill") as j:
+        for line in j.read().splitlines():
+            if line.startswith("#"):
+                tgt.write(line)
+                tgt.write("\n")
+    tgt.write("\n")
+    tgt.write("\n")
+    for src_name in SOURCE_FILES:
+        with open("src/{}".format(src_name)) as src:
+            for line in src.read().splitlines():
+                parts = line.split()
+                if len(parts) < 2 or parts[0] != 'from' or parts[1][0] != '.':
+                    tgt.write(line)
+                    tgt.write("\n")
+    tgt.write("app = JillApp()\n")
+    tgt.write("app.start()\n")
