@@ -1,3 +1,4 @@
+import json
 import logging
 import subprocess
 
@@ -38,6 +39,15 @@ def file_as_dict(file_path, separator=" "):
     with open(file_path) as f:
         return str_as_dict(f.read(), separator)
 
+def command_output(cmds):
+    proc = subprocess.Popen(cmds, stdout=subprocess.PIPE)
+    proc.wait()
+    out, err = proc.communicate()
+    if err:
+        logging.error(err)
+        raise Exception("Failed to run '{}'".format(cmd))
+    return out.decode("utf8")
+
 def command_as_dict(cmd, separator=None):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     proc.wait()
@@ -47,6 +57,15 @@ def command_as_dict(cmd, separator=None):
         raise Exception("Failed to run '{}'".format(cmd))
     return str_as_dict(out.decode("utf8"), separator)
     
+def command_as_json(cmds):
+    proc = subprocess.Popen(cmds, stdout=subprocess.PIPE)
+    proc.wait()
+    out, err = proc.communicate()
+    if err:
+        logging.error(err)
+        raise Exception("Failed to run '{}'".format(cmds))
+    return json.loads(out.decode("utf8"))
+
 def time_to_str(t, include_seconds):
     seconds = t - 60 * int(t / 60)
     t = (t - seconds) / 60
@@ -220,3 +239,12 @@ class LinkedList:
             result.append(t.obj)
             t = t.next
         return result
+
+class ValueCounter:
+    def __init__(self, some_dict):
+        self.count = {}
+        for v in some_dict.values():
+            if v in self.count:
+                self.count[v] += 1
+            else:
+                self.count[v] = 1

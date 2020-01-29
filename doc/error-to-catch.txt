@@ -1,0 +1,25 @@
+[franz@fortepiano ~]$ jill 
+Traceback (most recent call last):
+  File "/home/franz/bin/jill", line 36, in <module>
+    app.start()
+  File "/home/franz/work/jill/src/app.py", line 337, in start
+    t.event_loop()
+  File "/home/franz/work/jill/src/tui.py", line 708, in event_loop
+    self.handle_key(c)
+  File "/home/franz/work/jill/src/tui.py", line 687, in handle_key
+    sc.time_tick()
+  File "/home/franz/work/jill/src/app.py", line 327, in time_tick
+    self.model.time_tick()
+  File "/home/franz/work/jill/src/model.py", line 660, in time_tick
+    self.selinux_info.reload()
+  File "/home/franz/work/jill/src/model.py", line 93, in reload
+    values = command_as_dict('sestatus', ':')
+  File "/home/franz/work/jill/src/util.py", line 42, in command_as_dict
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+  File "/usr/lib64/python3.7/subprocess.py", line 800, in __init__
+    restore_signals, start_new_session)
+  File "/usr/lib64/python3.7/subprocess.py", line 1505, in _execute_child
+    part = os.read(errpipe_read, 50000)
+KeyboardInterrupt
+[franz@fortepiano ~]$ 
+

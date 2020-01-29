@@ -1,0 +1,13 @@
+
+add these two methods:
+
+
+getent passwd <uid>
+
+for details on a uid
+
+
+
+lslogins
+
+for an initial list of uid/name etc stuff

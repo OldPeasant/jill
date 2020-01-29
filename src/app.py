@@ -1,12 +1,13 @@
 import os
 import logging
+import time
 
 from .tui import curses_tui, Screen
 from .tui import Canvas, Container, Table, TableColumn, FilterTable, TitledBorder
 from .tui import HorizontalFlow, VerticalFlow, print_full_component, full_components_as_list
-from .model import JillModel, MemMapsSnapshot, PROC_STAT_DESC, SELinuxInfo, ThermalInfo
+from .model import JillModel, MemMapsSnapshot, PROC_STAT_DESC, SELinuxInfo, AppArmorInfo, ThermalInfo
 
-from .util import partition, MEM_UNITS, format_memory
+from .util import partition, MEM_UNITS, format_memory, read_single_line
 
 LOG_FOLDER = os.path.expanduser('~/log')
 
@@ -38,6 +39,25 @@ class SELinuxComponent(Table):
         self.set_value(3, 0, "MLS")
         self.set_value(3, 1, self.selinux_info.mls)
  
+class AppArmorComponent(Table):
+    def __init__(self, apparmor_info):
+        super(AppArmorComponent, self).__init__()
+        self.apparmor_info = apparmor_info
+        self.stretch_x = True
+
+    def update_from_model(self):
+        self.clear_table()
+        self.set_value(0, 0, "Enabled")
+        enabled_str = "?" if self.apparmor_info.enabled is None else "Yes" if self.apparmor_info.enabled else "No"
+        self.set_value(0, 1, enabled_str)
+        self.set_value(1, 0, "Mode")
+        self.set_value(1, 1, "?" if self.apparmor_info.mode is None else self.apparmor_info.mode)
+        if self.apparmor_info.count_enforce >= 0:
+            self.set_value(2, 0, "Enforce")
+            self.set_value(2, 1, "{} modules".format(self.apparmor_info.count_enforce))
+            self.set_value(3, 0, "Complain")
+            self.set_value(3, 1, "{} modules".format(self.apparmor_info.count_complain))
+
 class CpuUsageComponent(Table):
     def __init__(self, jill_model, core_columns):
         super(CpuUsageComponent, self).__init__()
@@ -219,10 +239,10 @@ class ProcessDetailsComponent(Table):
         self.set_value(0, 1, process_info.comm[:width_col_1])
         self.set_value(0, 2, "CPU")
         self.set_value(0, 3, "%d%% / %s" % (int(process_delta.cpu_usage(pid)), state) )
-        self.set_value(1, 0, "PID")
-        self.set_value(1, 1, "{}".format(pid))
-        self.set_value(1, 2, "PPID")
-        self.set_value(1, 3, "{}".format(process_info.ppid))
+        self.set_value(1, 0, "PID/PPID")
+        self.set_value(1, 1, "{}/{}".format(pid, process_info.ppid))
+        self.set_value(1, 2, "Running Time")
+        self.set_value(1, 3, "{} (started {})".format(process_info.running_time(), process_info.start_time()))
         self.set_value(2, 0, "U/S TIME")
         self.set_value(2, 1, "{}/{}".format(utime, stime))
         self.set_value(2, 2, "CU/CS TIME")
@@ -236,6 +256,13 @@ class ProcessDetailsComponent(Table):
             self.set_value(4, 1, process_info.selinux_1)
             self.set_value(4, 2, process_info.selinux_2)
             self.set_value(4, 3, process_info.selinux_3)
+        elif self.model.apparmor_info:
+            aa =  self.model.apparmor_info
+            self.set_value(4, 0, "AppArmor")
+            txt = read_single_line("/proc/{}/attr/current".format(pid))
+            if txt is None:
+                txt = "?"
+            self.set_value(4, 1, txt)
 
 class MainJillView(VerticalFlow):
         def __init__(self, model):
@@ -245,6 +272,7 @@ class MainJillView(VerticalFlow):
 
             ti = ThermalInfo()
             selinux_info = model.selinux_info
+            apparmor_info = model.apparmor_info
 
             top_boxes_count = 2 + len(model.battery_paths) + (1 if ti.thermal_zones else 0) + (1 if selinux_info() else 0)
 
@@ -253,6 +281,9 @@ class MainJillView(VerticalFlow):
             if selinux_info():
                 selinux = SELinuxComponent(selinux_info)
                 top_line.add(TitledBorder("SELinux", selinux))
+            if apparmor_info:
+                apparmor = AppArmorComponent(apparmor_info)
+                top_line.add(TitledBorder("AppArmor", apparmor))
 
             cpu = CpuUsageComponent(model, 4 if top_boxes_count >=4 else 8)
             top_line.add(TitledBorder("CPU", cpu))
@@ -294,11 +325,17 @@ class JillScreen(Screen):
             self.cols = cols
             self.view.layout(self.cols - 1, self.rows)
 
-    def time_tick(self, force_layout=False):
-        self.model.time_tick()
+    def time_tick(self, update_model, force_layout=False):
+        if update_model:
+            t1 = time.monotonic()
+            self.model.time_tick()
+            t2 = time.monotonic()
         self.view.update_from_model()
+        t3 = time.monotonic()
         if force_layout or not self.view.layout_valid:
             self.view.layout(self.cols - 1, self.rows)
+        t4 = time.monotonic()
+        #logging.info("Timetick: {:5.3f} / {:5.3f} / {:5.3f} => {:5.3f}".format(t2 - t1, t3 - t2, t4 - t3, t4 - t1))
 
 class JillApp:
     def start(self):

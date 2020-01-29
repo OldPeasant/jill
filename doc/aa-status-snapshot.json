@@ -1,0 +1,74 @@
+{
+	"version": "1", 
+	"profiles": {
+		"/usr/bin/evince": "enforce", 
+		"/usr/bin/evince-previewer": "enforce", 
+		"/usr/bin/evince-previewer//sanitized_helper": "enforce", 
+		"/usr/bin/evince-thumbnailer": "enforce", 
+		"/usr/bin/evince//sanitized_helper": "enforce", 
+		"/usr/bin/man": "enforce", 
+		"/usr/lib/cups/backend/cups-pdf": "enforce", 
+		"/usr/lib/telepathy/mission-control-5": "enforce", 
+		"/usr/lib/telepathy/telepathy-*": "enforce", 
+		"/usr/lib/telepathy/telepathy-*//pxgsettings": "enforce", 
+		"/usr/lib/telepathy/telepathy-*//sanitized_helper": "enforce", 
+		"/usr/lib/telepathy/telepathy-ofono": "enforce", 
+		"/usr/sbin/cups-browsed": "enforce", 
+		"/usr/sbin/cupsd": "enforce", 
+		"/usr/sbin/cupsd//third_party": "enforce", 
+		"/usr/sbin/haveged": "enforce", 
+		"/usr/sbin/ntpd": "enforce", 
+		"/usr/sbin/tcpdump": "enforce", 
+		"libreoffice-senddoc": "enforce", 
+		"libreoffice-soffice//gpg": "enforce", 
+		"libreoffice-xpdfimport": "enforce", 
+		"man_filter": "enforce", 
+		"man_groff": "enforce", 
+		"nvidia_modprobe": "enforce", 
+		"nvidia_modprobe//kmod": "enforce", 
+		"/usr/sbin/dnsmasq": "complain", 
+		"/usr/sbin/dnsmasq//libvirt_leaseshelper": "complain", 
+		"avahi-daemon": "complain", 
+		"identd": "complain", 
+		"klogd": "complain", 
+		"libreoffice-oopslash": "complain", 
+		"libreoffice-soffice": "complain", 
+		"mdnsd": "complain", 
+		"nmbd": "complain", 
+		"nscd": "complain", 
+		"ping": "complain", 
+		"smbd": "complain", 
+		"smbldap-useradd": "complain", 
+		"smbldap-useradd///etc/init.d/nscd": "complain", 
+		"syslog-ng": "complain", 
+		"syslogd": "complain", 
+		"traceroute": "complain"
+	}, 
+	"processes": {
+		"/usr/sbin/haveged": [
+			{"profile": "/usr/sbin/haveged", "pid": "550", "status": "enforce"}
+		], 
+		"/usr/sbin/cupsd": [
+			{"profile": "/usr/sbin/cupsd", "pid": "624", "status": "enforce"}
+		], 
+		"/usr/lib/cups/notifier/dbus": [
+			{"profile": "/usr/sbin/cupsd", "pid": "662", "status": "enforce"}, 
+			{"profile": "/usr/sbin/cupsd", "pid": "663", "status": "enforce"}, 
+			{"profile": "/usr/sbin/cupsd", "pid": "664", "status": "enforce"}, 
+			{"profile": "/usr/sbin/cupsd", "pid": "665", "status": "enforce"}
+		], 
+		"/usr/sbin/cups-browsed": [
+			{"profile": "/usr/sbin/cups-browsed", "pid": "666", "status": "enforce"}
+		], 
+		"/usr/sbin/ntpd": [
+			{"profile": "/usr/sbin/ntpd", "pid": "691", "status": "enforce"}
+		], 
+		"/usr/lib/telepathy/mission-control-5": [
+			{"profile": "/usr/lib/telepathy/mission-control-5", "pid": "1261", "status": "enforce"}
+		], 
+		"/usr/sbin/avahi-daemon": [
+			{"profile": "avahi-daemon", "pid": "616", "status": "complain"}, 
+			{"profile": "avahi-daemon", "pid": "627", "status": "complain"}
+		]
+	}
+}

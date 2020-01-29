@@ -2,6 +2,7 @@
 import curses
 import datetime
 import logging
+import time
 import traceback
 
 from .conf import CONF, GRAPH_CHAR
@@ -670,42 +671,54 @@ class Tui:
     def current_screen(self):
         return self._screens[self._current_screen_index]
 
-    def handle_key(self, c):
-        sc = self.current_screen
-        if c == curses.KEY_RESIZE:
-            max_y, max_x = self._stdscr.getmaxyx()
-            sc.resized(max_y, max_x)
-        elif c == 9: # TAB
-            sc.focus_next()
-        elif c == 353: # SHIFT-TAB
-            sc.focus_prev()
-        elif c == -1: # Timeout, no key pressed
-            #sc.time_tick()
-            pass
-        else: # let current screen decide what to do
-            sc.handle_key(c)
-        sc.time_tick()
-        if not sc.view.layout_valid:
-            sc.view.layout(sc.cols, sc.rows)
-        #for l in full_components_as_list(sc.view):
-        #    logging.info("==>{}".format(l))
-        sc.write(self._stdscr)
-        self._stdscr.refresh()
-        
-        
-        #logging.info("==== Components that can get focus: ====")
-        #for c in sc.focus_mgr.focusable_components.items():
-        #    logging.info("  {}: {}".format(c, c.has_focus))
-        #logging.info("========================================")
-
     def event_loop(self):
-        self.handle_key(curses.KEY_RESIZE)
+        #self.handle_key(curses.KEY_RESIZE)
+        max_y, max_x = self._stdscr.getmaxyx()
+        self.current_screen.resized(max_y, max_x)
+        self.current_screen.time_tick(True)
+        self.current_screen.view.layout(self.current_screen.cols, self.current_screen.rows)
+        self.current_screen.write(self._stdscr)
+        self._stdscr.refresh()
+        last_tick = time.monotonic()
         while (True):
             try:
                 c = self._stdscr.getch()
+                sc = self.current_screen
+                if c == curses.KEY_RESIZE:
+                    max_y, max_x = self._stdscr.getmaxyx()
+                    sc.resized(max_y, max_x)
+                elif c == 9: # TAB
+                    sc.focus_next()
+                elif c == 353: # SHIFT-TAB
+                    sc.focus_prev()
+                elif c == -1: # Timeout, no key pressed
+                    #sc.time_tick()
+                    pass
+                else: # let current screen decide what to do
+                    sc.handle_key(c)
+                if time.monotonic() - last_tick > 1:
+                    update_model = True
+                    last_tick = time.monotonic()
+                    logging.info("DoIt")
+                else:
+                    update_model = False
+                    logging.info("SkipIt")
+                sc.time_tick(update_model)
+                if not sc.view.layout_valid:
+                    sc.view.layout(sc.cols, sc.rows)
+                #for l in full_components_as_list(sc.view):
+                #    logging.info("==>{}".format(l))
+                sc.write(self._stdscr)
+                self._stdscr.refresh()
+        
+        
+                #logging.info("==== Components that can get focus: ====")
+                #for c in sc.focus_mgr.focusable_components.items():
+                #    logging.info("  {}: {}".format(c, c.has_focus))
+                #logging.info("========================================")
+
             except KeyboardInterrupt:
                 return
-            self.handle_key(c)
 
 
 class curses_tui:
