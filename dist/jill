@@ -984,7 +984,9 @@ class Screen:
             last.set_cursor(stdscr, x + last.x, y + last.y)
 
     def write(self, stdscr):
-        stdscr.clear()
+        # erase() only blanks the buffer; unlike clear() it doesn't force a full
+        # repaint, so curses sends just the changed cells (no flicker over SSH)
+        stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
         self.root_component.write(stdscr, 0, 0, max_x, max_y)
         in_focus = self.focus_mgr.focusable_components.current()
@@ -1031,6 +1033,9 @@ class Tui:
         if c == curses.KEY_RESIZE:
             max_y, max_x = self._stdscr.getmaxyx()
             sc.resized(max_y, max_x)
+            # the terminal content may be garbled after a resize, so repaint
+            # everything with the next refresh
+            self._stdscr.clear()
         elif c == 9: # TAB
             sc.focus_next()
         elif c == 353: # SHIFT-TAB
