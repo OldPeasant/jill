@@ -1,7 +1,5 @@
 import datetime
-import json
 import os
-import re
 import string
 import sys
 import time
@@ -10,7 +8,7 @@ import traceback
 import logging
 
 from .conf import GRAPH_CHAR
-from .util import read_single_line, command_as_dict, command_as_json, command_output, time_to_str, intersect_y, ValueCounter
+from .util import read_single_line, command_as_dict, command_output, time_to_str, duration_to_str, intersect_y
 
 POWER_SUPPLY_PATH = '/sys/class/power_supply/'
 
@@ -51,11 +49,12 @@ PROC_STAT_DESC = {
     'I' : "Idle"
 }
 
-
+		
 
 class CommandCache:
     def __init__(self):
-        self.commands = {}
+        # keyed by (pid, starttime) so that a recycled PID never shows the old command
+        self.command_by_key = {}
 
     @staticmethod
     def _sanitize_string(s):
@@ -69,22 +68,28 @@ class CommandCache:
         return r
 
     def get_command(self, pid, starttime):
-        key = "%d%d" % (pid, starttime)
-        if key in self.commands:
-            return self.commands[key]
-        try:
-            command_line = read_single_line("/proc/%d/cmdline" % pid)
-            if command_line:
-                command_line = CommandCache._sanitize_string(command_line)
-            else:
-                command_line = read_single_line("/proc/%d/comm" % pid)
-            if not(command_line):
+        """Returns the command line of the process, or None if the process is gone."""
+        key = (pid, starttime)
+        if key in self.command_by_key:
+            return self.command_by_key[key]
+        command_line = read_single_line("/proc/%d/cmdline" % pid)
+        if command_line is None:
+            return None
+        if command_line:
+            command_line = CommandCache._sanitize_string(command_line)
+        else:
+            # kernel threads and zombies have an empty cmdline
+            command_line = read_single_line("/proc/%d/comm" % pid)
+            if command_line is None:
+                return None
+            if not command_line:
                 command_line = "** command not found **"
-        except:
-            err = traceback.format_exc()
-            command_line = "ERR: %s" % str(err) # + p[1].split("(")[1].split(")")[0]
-        self.commands[key] = command_line
+        self.command_by_key[key] = command_line
         return command_line
+
+    def prune(self, live_keys):
+        """Forgets the commands of all processes not in live_keys."""
+        self.command_by_key = {k: v for k, v in self.command_by_key.items() if k in live_keys}
 
 
 class SELinuxInfo:
@@ -105,9 +110,6 @@ class SELinuxInfo:
     def enabled(self):
         return self.status == 'enabled'
 
-    def __str__(self):
-        return "SELinfoInfo[{}, {}, {}, {}]".format(self.status, self.policy, self.mode, self.mls)
-
     def __call__(self):
         return self.enabled
 
@@ -117,68 +119,96 @@ def apparmor_module_loaded():
 class AppArmorInfo:
     def __init__(self):
         self.reload()
+
     def reload(self):
-        
         enabled_str = read_single_line("/sys/module/apparmor/parameters/enabled")
-        if enabled_str is None:
-            self.enabled = None
-        else:
-            self.enabled = 'Y' == enabled_str
-        self.mode = read_single_line("/sys/module/apparmor/parameters/mode")
-        if not self.mode:
-            self.mode = None
-        fs = self.find_apparmorfs()
-        self.count_complain = 0
-        self.count_enforce = 0
+        self.enabled = None if enabled_str is None else enabled_str == 'Y'
+        self.mode = read_single_line("/sys/module/apparmor/parameters/mode") or None
+        # profile counts by mode (enforce, complain, kill, unconfined, ...);
+        # None if the profiles can't be read (usually requires root)
+        self.profile_count_by_mode = None
+        fs = AppArmorInfo.find_apparmorfs()
         if fs:
             try:
                 with open(os.path.join(fs, "profiles")) as f:
+                    counts = {}
                     for l in f.read().splitlines():
-                        p1 = l.split(" (")
-                        p2 = p1[1].split(")")
-                        logging.info("AA PROFILE: {} => {}".format(p1[0], p2[0]))
-                        if p2[0] == 'enforce':
-                            self.count_enforce += 1
-                        elif p2[0] == 'complain':
-                            self.count_complain += 1
-                        else:
-                            raise Exception("Unexpected mode '{}'".format(p2[0]))
-            except PermissionError:
-                self.count_complain = -1
-                self.count_enforce = -1
+                        # format: "<profile name> (<mode>)"
+                        if l.endswith(")") and " (" in l:
+                            mode = l[l.rindex(" (") + 2:-1]
+                            counts[mode] = counts.get(mode, 0) + 1
+                    self.profile_count_by_mode = counts
+            except OSError:
+                pass
 
-    def find_apparmorfs(self):
-        '''Finds AppArmor mount point'''
-        for p in open("/proc/mounts","rb").readlines():
-            if p.split()[2].decode() == "securityfs" and \
-               os.path.exists(os.path.join(p.split()[1].decode(), "apparmor")):
-                return os.path.join(p.split()[1].decode(), "apparmor")
-        return False
+    @staticmethod
+    def find_apparmorfs():
+        """Returns the AppArmor directory in securityfs, or None if not mounted."""
+        try:
+            with open("/proc/mounts") as f:
+                for l in f.read().splitlines():
+                    parts = l.split()
+                    if len(parts) >= 3 and parts[2] == "securityfs":
+                        path = os.path.join(parts[1], "apparmor")
+                        if os.path.exists(path):
+                            return path
+        except OSError:
+            pass
+        return None
 
 #############################################################################
 # /etc user modelling
 #############################################################################
 
 class UserInfo:
+    """Maps UIDs to user names. Besides /etc/passwd, this also covers users from
+    other NSS sources (LDAP, SSSD, ...) via lslogins and getent."""
+
+    # how long a UID that couldn't be resolved is remembered before trying again
+    UNKNOWN_UID_RETRY_SECONDS = 60
+
     def __init__(self):
         self.username_by_uid = {}
-        for l in command_output(['lslogins']).splitlines()[1:]:
-            if l:
-                parts = re.split(' +', l.strip())
-                uid = int(parts[0])
-                name = parts[1]
-                self.username_by_uid[uid] = name
-                #logging.info("USERNAME {} -> {} from lslogins".format(uid, name))
+        self.unknown_uids = set()
+        self.unknown_uids_since = time.monotonic()
+        self._read_passwd()
+        self._read_lslogins()
+
+    def _read_passwd(self):
+        try:
+            with open("/etc/passwd", 'r') as f:
+                for l in f.read().splitlines():
+                    parts = l.split(":")
+                    if len(parts) >= 3 and parts[2].isdigit():
+                        self.username_by_uid[int(parts[2])] = parts[0]
+        except OSError:
+            pass
+
+    def _read_lslogins(self):
+        out = command_output(['lslogins', '--noheadings', '--raw', '--output=UID,USER'])
+        if out is None:
+            return
+        for l in out.splitlines():
+            parts = l.split()
+            if len(parts) == 2 and parts[0].isdigit():
+                self.username_by_uid[int(parts[0])] = parts[1]
 
     def get_username(self, uid):
-        try:
+        """Returns the user name of uid, or the UID itself as string if it is unknown."""
+        if uid in self.username_by_uid:
             return self.username_by_uid[uid]
-        except KeyError:
+        if time.monotonic() - self.unknown_uids_since > UserInfo.UNKNOWN_UID_RETRY_SECONDS:
+            self.unknown_uids = set()
+            self.unknown_uids_since = time.monotonic()
+        if uid not in self.unknown_uids and uid >= 0:
             out = command_output(['getent', 'passwd', str(uid)])
-            name = out.split(':')[0]
-            self.username_by_uid[uid] = name
-            logging.info("USERNAME {} -> {} from getent".format(uid, name))
-            return name
+            name = out.split(':')[0] if out else ''
+            if name:
+                self.username_by_uid[uid] = name
+                return name
+            self.unknown_uids.add(uid)
+        return str(uid)
+
 
 #############################################################################
 # /proc modelling
@@ -281,10 +311,9 @@ class MemMapsSnapshot:
     def __init__(self, pid):
         try:
             self.rw_mem = self._calc_sum(pid)
-        except PermissionError:
-            self.rw_mem = 0;
-        except FileNotFoundError:
-            self.rw_mem = 0;
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            # no access, or the process is already gone
+            self.rw_mem = 0
 
     def _calc_sum(self, pid):
         sum = 0
@@ -334,19 +363,8 @@ class CpuSnapshot:
                     pass # ignore this line
 
     def format_uptime(self):
-        t = int(self.uptime)
-        return time_to_str(t, True)
+        return duration_to_str(self.uptime)
 
-
-class Process:
-    def __init__(self, uid, stat_items):
-        self.uid = uid
-        self.stat_items = stat_items
-        self.pid = int(stat_items[0])
-        self.ppid = int(stat_items[3])
-        self.starttime = int(stat_items[22])
-        self.parent = None
-        self.child_processes = []
 
 class ProcessInfo:
     def __init__(self, selinux_enabled, uptime, uid, pid, state, ppid, comm, utime, stime, cutime, cstime, starttime, vsize):
@@ -389,17 +407,16 @@ class ProcessInfo:
             self.selinux_2 = None
             self.selinux_3 = None
         
+    def running_seconds(self):
+        """Seconds since the process was started."""
+        return max(0.0, self.uptime - self.starttime / CLOCK_TICKS)
+
     def get_state_text(self):
         if self.state in PROC_STAT_DESC:
             return PROC_STAT_DESC[self.state]
         else:
             return "Unknown %s" % self.state
 
-    def running_time(self):
-        return time_to_str(self.uptime -  self.starttime / CLOCK_TICKS, True)
-
-    def start_time(self):
-        return time_to_str((time.time() -  time.timezone) - (self.uptime - self.starttime / CLOCK_TICKS), True)
 
 class ProcessTreeLine:
     def __init__(self, user_info, process_delta, max_pid, process_info, parents_last, this_last):
@@ -408,11 +425,7 @@ class ProcessTreeLine:
         self.this_last = this_last
         self.max_pid = max_pid
         self.values = {}
-        try:
-            self.values['UID'] = user_info.get_username(process_info.uid)
-        except KeyError:
-            logging.error("User {} not found in /etc/passwd".format(process_info.uid))
-            self.values['UID'] = str(process_info.uid)
+        self.values['UID'] = user_info.get_username(process_info.uid)
         try:
             self.values['PID'] = str(process_info.pid)
             self.values['PPID'] = str(process_info.ppid)
@@ -445,57 +458,6 @@ class ProcessTreeLine:
         s += self.process_info.comm 
         return s
 
-def split_process_info_line(line):
-    try:
-        split1 = line.split("(" * line.count("("))
-        before = split1[0][:-1]
-        split2 = split1[1].split(")" * line.count("("))
-        mid = split2[0]
-        after = split2[1][1:]
-        result = before.split(" ") + [mid] + after.split(" ")
-        return result
-    except:
-        raise Exception(line)
-
-def split_process_info_line_quick(line):
-    result = []
-    current = ""
-    mode = 'N'
-    for c in line:
-        if mode == 'N':
-            if c == ' ':
-                pass
-            elif c == '(':
-                mode = 'B'
-            else:
-                mode = 'T'
-                current += c
-        elif mode == 'B':
-            if c == '(':
-                mode = 'BB'
-            elif c == ')':
-                result.append(current)
-                current = ""
-                mode = 'N'
-            else:
-                current += c
-        elif mode == 'BB':
-            if c == ')':
-                mode = 'B'
-            else:
-                current += c
-        elif mode == 'T':
-            if c == ' ':
-                result.append(current)
-                current = ""
-                mode = 'N'
-            else:
-                current += c
-        else:
-            raise Exception("Unexpected mode {}".format(mode))
-    if current:
-        result.append(current)
-    return result
 
 class ProcessSnapshot:
     def __init__(self, selinux_enabled, user_info, uptime, command_cache):
@@ -503,95 +465,86 @@ class ProcessSnapshot:
         self.user_info = user_info
         self.uptime = uptime
         self.command_cache = command_cache
+        # filled by get_process_lines; empty until then (e.g. the very first snapshot)
+        self.process_info_by_pid = {}
+
 
     @staticmethod
     def read_all_pids():
         pids = []
         for l in os.listdir("/proc"):
-            try:
+            if l.isnumeric():
                 pids.append(int(l))
-            except ValueError:
-                # l is not a number => ignore it
-                pass
         return pids
 
+    @staticmethod
+    def _split_process_info_line(line):
+        try:
+            # comm may itself contain parentheses, so it spans from the first "(" to the last ")"
+            start = line.index("(")
+            end = line.rindex(")")
+            before = line[:start - 1]
+            mid = line[start + 1:end]
+            after = line[end + 2:]
+            result = before.split(" ") + [mid] + after.split(" ")
+            return result
+        except:
+            raise Exception(line)
 
     @staticmethod
-    def read_processes():
-        all_processes = []
-        zero_process = Process(0, ['0', "", "", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"])
-        process_by_pid = {}
-        process_by_pid[0] = zero_process
-        for pid in ProcessSnapshot.read_all_pids():
-            line = read_single_line("/proc/%d/stat" % pid)
-            if line:
-                
-                uid = -1
-                with open("/proc/%d/status" % pid, 'r') as f:
-                    try:
-                        lines = f.read().splitlines()
-                    except:
-                        uid = 0
-                    else:
-                        for l in lines:
-                            if l.startswith("Uid:"):
-                                parts = l.split("\t")
-                                uid = int(parts[1])
-                                break
-                p = Process(uid, split_process_info_line_quick(line))
-                all_processes.append(p)
-                process_by_pid[pid] = p
+    def _read_uid(pid):
+        with open("/proc/%d/status" % pid, 'r') as f:
+            for l in f.read().splitlines():
+                if l.startswith("Uid:"):
+                    return int(l.split("\t")[1])
+        return -1
 
-        for p in all_processes:
-            if p.ppid in process_by_pid:
-                pp = process_by_pid[p.ppid]
-                pp.child_processes.append(p)
-                p.parent = pp
-            else:
-                raise Exception("Didn't find parent process for {}".format(p.stat_items))
-        return zero_process
+    @staticmethod
+    def _read_process_info(selinux_enabled, uptime, command_cache, pid):
+        """Reads the info of a single process, or returns None if the process is gone."""
+        line = read_single_line("/proc/%d/stat" % pid)
+        if not line:
+            return None
+        p = ProcessSnapshot._split_process_info_line(line)
+        if pid != int(p[0]):
+            raise Exception("Nasty inconsistency for %d: %s" % (pid, p[0]))
+        starttime = float(p[21])
+        #starttime = (time.time() - uptime) + float(float(p[21]) /  CLOCK_TICKS)
+        command_line = command_cache.get_command(pid, starttime)
+        if command_line is None:
+            return None
+        try:
+            uid = ProcessSnapshot._read_uid(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        return ProcessInfo(
+            selinux_enabled,
+            uptime,
+            uid,
+            pid,
+            p[2],
+            int(p[3]),
+            command_line,
+            int(p[12]),
+            int(p[13]),
+            int(p[14]),
+            int(p[15]),
+            starttime,
+            int(p[22])
+        )
 
     @staticmethod
     def _read_process_info_list(selinux_enabled, uptime, command_cache, filter):
-        t0 = time.monotonic()
-        result =  []
-        all_pids = ProcessSnapshot.read_all_pids()
-        for pid in all_pids:
-            line = read_single_line("/proc/%d/stat" % pid)
-            if line:
-                p = split_process_info_line(line)
-                if pid != int(p[0]):
-                    raise Exception("Nasty inconsistency for %d: %s" % (pid, p[0]))
-                command_line = command_cache.get_command(pid, int(p[22]))
-                starttime = float(p[21])
-                uid = -1
-                with open("/proc/%d/status" % pid, 'r') as f:
-                    try:
-                        lines = f.read().splitlines()
-                    except:
-                        uid = 0
-                    else:
-                        for l in lines:
-                            if l.startswith("Uid:"):
-                                parts = l.split("\t")
-                                uid = int(parts[1])
-                                break
-                result.append(ProcessInfo(
-                    selinux_enabled,
-                    uptime,
-                    uid,
-                    pid,
-                    p[2],
-                    int(p[3]),
-                    command_line,
-                    int(p[12]),
-                    int(p[13]),
-                    int(p[14]),
-                    int(p[15]),
-                    starttime,
-                    int(p[22])
-                ))
+        # Processes may exit at any time while we read /proc. Such processes are
+        # silently skipped; they will simply be missing from this snapshot.
+        result = []
+        for pid in ProcessSnapshot.read_all_pids():
+            pi = ProcessSnapshot._read_process_info(selinux_enabled, uptime, command_cache, pid)
+            if pi is not None:
+                result.append(pi)
+        command_cache.prune(set((pi.pid, pi.starttime) for pi in result))
         return result
+
     @staticmethod
     def get_all_descendants(process_info):
         children = []
@@ -600,12 +553,6 @@ class ProcessSnapshot:
             children.extend(ProcessSnapshot.get_all_descendants(c))
         return children
 		
-    def set_show_descendants(self, pids_to_show, pi):
-        if pi.pid not in pids_to_show:
-            pids_to_show.add(pi.pid)
-            for c in pi.children:
-                self.set_show_descendants(pids_to_show, c)
-
     def get_all_descendant_pis(self, pi):
         children = []
         for c in self.process_list:
@@ -629,10 +576,7 @@ class ProcessSnapshot:
 
     @staticmethod
     def matches_info(user_info, process_info, filter_values):
-        try:
-            username = user_info.get_username(process_info.uid)
-        except:
-            username = '???'
+        username = user_info.get_username(process_info.uid)
         if filter_values['UID'] not in username:
             return False
         if filter_values['PID'] not in str(process_info.pid):
@@ -651,12 +595,6 @@ class ProcessSnapshot:
         return True
 
     def get_process_lines(self, process_delta, filter = {}):
-
-        #ta0 = time.monotonic()
-        #root = ProcessSnapshot.read_processes()
-        #ta1 = time.monotonic()
-        #logging.info("TA {:12f}".format(ta1 - ta0))
-        t0 = time.monotonic()
         self.root = ProcessInfo(self.selinux_enabled, self.uptime, 0, 0, '0', None, "Root", 0, 0, 0, 0, 0, 0)
         self.max_pid = 0
         self.process_list = [self.root]
@@ -672,25 +610,28 @@ class ProcessSnapshot:
         for pi in self.process_list:
             if ProcessSnapshot.matches_info(self.user_info, pi, filter):
                 up = pi
-                while up is not None and up != self.root and not up.pid in pids_to_show:
+                while up is not None and up != self.root:
                     pids_to_show.add(up.pid)
-                    up = self.process_info_by_pid[up.ppid]
-                #self.set_show_descendants(pids_to_show, pi)
+                    up = self.process_info_by_pid.get(up.ppid)
                 for pic in self.get_all_descendant_pis(pi):
                     pids_to_show.add(pic.pid)
 
 
         for p in self.process_list:
             if not(p.ppid is None) and p.pid in pids_to_show:
-                self.process_info_by_pid[p.ppid].children.append(p)
-                p.parent = self.process_info_by_pid[p.ppid]
+                # the parent may have exited while we were reading /proc; until the
+                # kernel reparents the process, show it directly below the root
+                parent = self.process_info_by_pid.get(p.ppid, self.root)
+                parent.children.append(p)
+                p.parent = parent
 
         lines = []
         ProcessSnapshot._add_lines(self.user_info, process_delta, self.max_pid, lines, [], True, self.root, pids_to_show)
+        lines_by_pid = {}
+        for l in lines:
+            pid = l.values['PID']
+            lines_by_pid[pid] = l
 
-        t1 = time.monotonic()
-
-        logging.info("TO {:12f}".format(t1 - t0))
         return lines
 
 class Snapshot:
@@ -746,32 +687,39 @@ class ProcessDelta:
         self.process_snapshot1 = process_snapshot1
         self.process_snapshot2 = process_snapshot2
 
-    def get_single_process_delta(self, pid):
-        pi1 = self.process_snapshot1.process_info_by_pid[pid]
-        pi2 = self.process_snapshot2.process_info_by_pid[pid]
-        if pi1 and pi2:
-            du = pi2.utime - pi1.utime
-            ds = pi2.stime - pi1.stime
-            cu = pi2.cutime - pi1.cutime
-            cs = pi2.cstime - pi1.cstime
-            return SingleProcessDelta(du, ds, cu, cs)
-        else:
+    def _get_infos(self, pid):
+        """Returns the infos of pid in both snapshots, or None if the process
+        is not present in both (newly started, gone, or PID recycled)."""
+        info1 = self.process_snapshot1.process_info_by_pid.get(pid)
+        info2 = self.process_snapshot2.process_info_by_pid.get(pid)
+        if info1 is None or info2 is None or info1.starttime != info2.starttime:
             return None
+        return info1, info2
+
+    def get_single_process_delta(self, pid):
+        infos = self._get_infos(pid)
+        if infos is None:
+            return SingleProcessDelta(0, 0, 0, 0)
+        pi1, pi2 = infos
+        du = pi2.utime - pi1.utime
+        ds = pi2.stime - pi1.stime
+        cu = pi2.cutime - pi1.cutime
+        cs = pi2.cstime - pi1.cstime
+        return SingleProcessDelta(du, ds, cu, cs)
 
     def cpu_usage(self, pid):
-        try:
-            info1 = self.process_snapshot1.process_info_by_pid[pid]
-            info2 = self.process_snapshot2.process_info_by_pid[pid]
-        except:
-            #logging.error(traceback.format_exc())
+        infos = self._get_infos(pid)
+        if infos is None:
             return 0
-        
-
+        info1, info2 = infos
         total_time_1 = info1.utime + info1.stime
         total_time_2 = info2.utime + info2.stime
         delta_total = total_time_2 - total_time_1
         seconds = info2.uptime - info1.uptime
-        return 100.0 * ((delta_total / CLOCK_TICKS) / seconds)
+        if seconds <= 0:
+            return 0
+        cpu_usage = 100.0 * ((delta_total / CLOCK_TICKS) / seconds)
+        return cpu_usage
 
 class Delta:
     def __init__(self, snapshot1, snapshot2):
@@ -783,10 +731,7 @@ class JillModel:
     def __init__(self):
         self.delta = None
         self.selinux_info = SELinuxInfo()
-        if apparmor_module_loaded():
-            self.apparmor_info = AppArmorInfo()
-        else:
-            self.apparmor_info = None
+        self.apparmor_info = AppArmorInfo() if apparmor_module_loaded() else None
         self.command_cache = CommandCache()
         self.battery_paths = find_battery_paths()
         self.thermal_info = ThermalInfo()
@@ -799,6 +744,8 @@ class JillModel:
 
     def time_tick(self):
         self.selinux_info.reload()
+        if self.apparmor_info:
+            self.apparmor_info.reload()
         new_snapshot = Snapshot(self.selinux_info(), self.user_info, self.command_cache)
         self.delta = Delta(self.snapshot, new_snapshot)
         self.mem_info_snapshot = MemInfoSnapshot()
